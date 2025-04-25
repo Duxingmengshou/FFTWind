@@ -1,0 +1,6 @@
+# python使用3.8
+
+opencv-python
+pyqt5
+numpy
+pygame
