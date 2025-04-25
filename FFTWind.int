@@ -1,0 +1,221 @@
+import numpy as np
+from numpy.fft import fft
+import re
+from typing import List
+import pygame, math
+from pygame.locals import *
+
+from utils.SVG import *
+from utils.OpencvUtils import *
+
+import configparser
+from os.path import abspath
+
+
+config = configparser.ConfigParser()
+config.read('./app.conf')
+og_image_path = config.get('paths', 'og_image_path', fallback='')
+bi_image_path = config.get('paths', 'bi_image_path', fallback='')
+bina_svg_path = config.get('paths', 'bina_svg_path', fallback='')
+
+og_image_fullpath = abspath(og_image_path)
+bina_svg_fullpath =abspath(bina_svg_path)
+
+print(og_image_fullpath)
+
+WINDOW_W = config.getint('window', 'width', fallback=1280)
+WINDOW_H = config.getint('window', 'height', fallback=791)
+
+point_size = config.getint('drawing', 'point_size', fallback=4)
+thick_ness = config.getint('drawing', 'thickness', fallback=1)
+scale_size = config.getfloat('drawing', 'scale', fallback=1.0)
+
+bi_image_path=Sobel(og_image_fullpath)
+bitmap_to_contour_svg(bi_image_path, bina_svg_fullpath)
+
+FOURIER_LIMIT = 200000  # 控制傅里叶项数量
+MAX_TRACE_LENGTH = 20000  # 控制绘制路径长度
+
+def fftProcess(svg_filename: str) -> List[List[float]]:
+    with open(svg_filename, "r") as f:
+        content = f.read()
+        point_list = []
+        paths = re.findall(r"\bd=\"(.*?)\"", content)
+        for path in paths:
+            points = re.findall(r"-?\d+\.?\d*e?-?\d*?", path)
+            for i in range(0, len(points), 2):
+                point_list.append((float(points[i + 1]), float(points[i])))
+
+    y = [complex(p[0] - 270, p[1] - 270) for p in point_list]
+    y_len = len(y)
+    yy = fft(y)
+
+    PP = []
+    for i, v in enumerate(yy[:y_len]):
+        c = -2 * np.pi * i / y_len
+        PP.append([-v.real / y_len, c, -np.pi / 2])
+        PP.append([-v.imag / y_len, c, np.pi])
+
+    PP.sort(key=lambda x: abs(x[0]), reverse=True)
+    return PP[:FOURIER_LIMIT]
+
+
+def draw(filename: str):
+    fourier_list = fftProcess(filename)
+    FPS = 120
+    if len(fourier_list)<=1000:
+        FPS=24
+    elif len(fourier_list)<=5000:
+        FPS=60
+    else:
+        FPS=120
+    start_xy = (WINDOW_W // 6, WINDOW_H // 2)
+
+    # 优化配色
+    COLORS = {
+        'background': (20, 24, 28),
+        'circles': [
+            (255, 87, 51),
+            (54, 162, 235),
+            (255, 206, 86),
+            (75, 192, 192),
+            (153, 102, 255),
+            (255, 159, 64),
+        ],
+        'orbit': (90, 100, 140),
+        'connection': (240, 240, 255),
+        'trace': (255, 255, 255),
+    }
+
+    pygame.init()
+    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), DOUBLEBUF | RESIZABLE)
+    pygame.display.set_caption("傅里叶变换绘制图片")
+    trace_surface = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+    clock = pygame.time.Clock()
+
+    class Circle:
+        def __init__(self, r, angle_v, angle, color=None, father=None):
+            self.r = r
+            self.angle_v = angle_v
+            self.angle = angle
+            self.father = father
+            self.x, self.y = 0, 0
+            self.color = color if color else (255, 255, 255)
+
+        def set_xy(self, xy):
+            self.x, self.y = xy
+
+        def get_xy(self):
+            return self.x, self.y
+
+        def set_xy_by_angle(self):
+            self.x = self.father.x + self.r * math.cos(self.angle) * scale_size
+            self.y = self.father.y + self.r * math.sin(self.angle) * scale_size
+
+        def run(self, step_time):
+            if self.father is not None:
+                self.angle += self.angle_v * step_time
+                self.set_xy_by_angle()
+
+        def draw(self, screen):
+            if self.father is not None:
+                pygame.draw.circle(
+                    screen,
+                    COLORS['orbit'],
+                    (int(round(self.father.x)), int(round(self.father.y))),
+                    max(int(round(abs(self.r) * scale_size)), 1),
+                    1
+                )
+                pygame.draw.line(
+                    screen,
+                    COLORS['connection'],
+                    (self.father.x, self.father.y),
+                    (self.x, self.y),
+                    thick_ness
+                )
+            pygame.draw.circle(
+                screen,
+                self.color,
+                (int(round(self.x)), int(round(self.y))),
+                point_size
+            )
+
+    # 构建傅里叶圆
+    super_circle = Circle(0, 0, 0, color=COLORS['circles'][0])
+    super_circle.set_xy(start_xy)
+    circle_list = [super_circle]
+
+    for i in range(len(fourier_list)):
+        color_idx = (i + 1) % len(COLORS['circles'])
+        circle_list.append(
+            Circle(
+                fourier_list[i][0],
+                fourier_list[i][1],
+                fourier_list[i][2],
+                color=COLORS['circles'][color_idx],
+                father=circle_list[i]
+            )
+        )
+
+    trace_points = []
+
+    # 主循环
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == QUIT:
+                running = False
+
+        screen.fill(COLORS['background'])
+        trace_surface.fill((0, 0, 0, 0))  # 清空透明surface
+
+        for circle in circle_list:
+            circle.run(1)
+            circle.draw(screen)
+
+        # 添加末端轨迹
+        last_xy = circle_list[-1].get_xy()
+        trace_points.append(last_xy)
+        if len(trace_points) > MAX_TRACE_LENGTH:
+            trace_points.pop(0)
+
+        if len(trace_points) > 2:
+            # 定义渐变起止颜色 (RGB格式)
+            start_color = (0, 180, 216)    # 蓝青色
+            end_color = (238, 96, 85)      # 珊瑚红
+            total_points = len(trace_points)
+            
+            # 分段绘制渐变轨迹
+            for i in range(len(trace_points) - 1):
+                # 计算当前段的渐变进度 (0~1)
+                progress = i / (len(trace_points) - 1)
+                
+                # 线性插值RGB颜色
+                r = int(start_color[0] + (end_color[0] - start_color[0]) * progress)
+                g = int(start_color[1] + (end_color[1] - start_color[1]) * progress)
+                b = int(start_color[2] + (end_color[2] - start_color[2]) * progress)
+                
+                # 计算透明度 (新点不透明，旧点逐渐透明)
+                alpha = int(255 * pow(i / total_points,0.5))  # 使用平方根曲线使尾部过渡更自然
+                
+                # 绘制线段
+                pygame.draw.line(
+                    trace_surface,
+                    (r, g, b, alpha),
+                    trace_points[i],
+                    trace_points[i + 1],
+                    thick_ness + 1  # 比连接线稍粗
+                )
+
+        screen.blit(trace_surface, (0, 0))
+        pygame.display.flip()
+        clock.tick(FPS)
+
+
+    pygame.quit()
+
+
+# 示例
+if __name__ == "__main__":
+    draw(bina_svg_path)
+

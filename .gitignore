@@ -1,0 +1,4 @@
+# 忽略目录名称
+runtime/
+site-packages/
+__pycache__/
